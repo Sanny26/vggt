@@ -202,7 +202,18 @@ class DPTHead(nn.Module):
         out = []
         dpt_idx = 0
 
-        for layer_idx in self.intermediate_layer_idx:
+        # print('Aggregated tokens list length:', len(aggregated_tokens_list))
+        # print('Intermediate layer indices:', self.intermediate_layer_idx)
+
+        # Asynchronously prefect aggregated tokens
+        if self.offload_intermediate:
+            aggregated_tokens_list[0] = aggregated_tokens_list[0].to("cuda", non_blocking=True)
+        
+        # for layer_idx in self.intermediate_layer_idx:
+        for layer_idx in range(len(aggregated_tokens_list)):
+            # print('Processing layer', layer_idx)
+            if self.offload_intermediate and layer_idx <= len(aggregated_tokens_list) - 2: # until N-1
+                aggregated_tokens_list[layer_idx+1] = aggregated_tokens_list[layer_idx+1].to("cuda", non_blocking=True)
             x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
 
             # Select frames if processing a chunk
@@ -211,7 +222,7 @@ class DPTHead(nn.Module):
 
             x = x.reshape(B * S, -1, x.shape[-1])
 
-            x = self.norm(x)
+            x = self.norm(x.to(torch.float))
 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
 
@@ -222,6 +233,10 @@ class DPTHead(nn.Module):
 
             out.append(x)
             dpt_idx += 1
+            # offloading to cpu again after computation
+            if self.offload_intermediate:
+                aggregated_tokens_list[layer_idx].to("cpu", non_blocking=True)
+
 
         # Fuse features from multiple layers.
         out = self.scratch_forward(out)

@@ -9,7 +9,7 @@
 
 import logging
 import os
-from typing import Callable, List, Any, Tuple, Dict
+from typing import Callable, List, Any, Tuple, Dict, Optional
 import warnings
 
 import torch
@@ -42,8 +42,9 @@ class Block(nn.Module):
         attn_class: Callable[..., nn.Module] = Attention,
         ffn_layer: Callable[..., nn.Module] = Mlp,
         qk_norm: bool = False,
-        fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
+        # fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        attn_impl: Optional[str] = 'sdpa',
     ) -> None:
         super().__init__()
 
@@ -57,8 +58,9 @@ class Block(nn.Module):
             attn_drop=attn_drop,
             proj_drop=drop,
             qk_norm=qk_norm,
-            fused_attn=fused_attn,
+            # fused_attn=fused_attn,
             rope=rope,
+            attn_impl=attn_impl,
         )
 
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -236,9 +238,9 @@ class NestedTensorBlock(Block):
             x = x + ffn_residual_func(x)
             return attn_bias.split(x)
 
-    def forward(self, x_or_x_list):
+    def forward(self, x_or_x_list, pos=None):
         if isinstance(x_or_x_list, Tensor):
-            return super().forward(x_or_x_list)
+            return super().forward(x_or_x_list, pos=pos)
         elif isinstance(x_or_x_list, list):
             if not XFORMERS_AVAILABLE:
                 raise AssertionError("xFormers is required for using nested tensors")

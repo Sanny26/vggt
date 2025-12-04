@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
@@ -15,18 +17,40 @@ from vggt.heads.track_head import TrackHead
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
-                 enable_camera=True, enable_point=True, enable_depth=True, enable_track=True):
+    def __init__(
+        self,
+        img_size=518,
+        patch_size=14,
+        embed_dim=1024,
+        enable_camera=True,
+        enable_point=True,
+        enable_depth=True,
+        enable_track=True,
+        attn_impl: str = "sdpa",
+    ):
         super().__init__()
 
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            attn_impl=attn_impl,
+        )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1") if enable_point else None
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
+        self.aggregator.intermediate_layer_idx = self.point_head.intermediate_layer_idx
+        self.aggregator.offload_intermediate = False
+        self.depth_head.offload_intermediate = False
+        self.point_head.offload_intermediate = False
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+    def forward(
+        self,
+        images: torch.Tensor,
+        query_points: torch.Tensor = None,
+    ):
         """
         Forward pass of the VGGT model.
 
@@ -58,30 +82,41 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
+        # print(f"Before aggregator: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         aggregated_tokens_list, patch_start_idx = self.aggregator(images)
-
+        # print(f"After aggregator: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         predictions = {}
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
+            # disables autocast for the heads with enabled=False
+            # print(f"Before camera_head: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
             if self.camera_head is not None:
                 pose_enc_list = self.camera_head(aggregated_tokens_list)
                 predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration
                 predictions["pose_enc_list"] = pose_enc_list
-                
+            # print(f"After camera_head: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+
+            # print(f"Before depth_head: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
             if self.depth_head is not None:
                 depth, depth_conf = self.depth_head(
                     aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
                 )
                 predictions["depth"] = depth
                 predictions["depth_conf"] = depth_conf
+            # print(f"After depth_head: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
+
+            # print(f"Before point_head: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
             if self.point_head is not None:
                 pts3d, pts3d_conf = self.point_head(
                     aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
                 )
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
+            # print(f"After point_head: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
+        
+        # print(f"Before track_head: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(
                 aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx, query_points=query_points
@@ -89,9 +124,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predictions["track"] = track_list[-1]  # track of the last iteration
             predictions["vis"] = vis
             predictions["conf"] = conf
+        # print(f"After track_head: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
         if not self.training:
             predictions["images"] = images  # store the images for visualization during inference
 
         return predictions
-

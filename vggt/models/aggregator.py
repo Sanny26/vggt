@@ -47,6 +47,7 @@ class Aggregator(nn.Module):
         qk_norm (bool): Whether to apply QK normalization.
         rope_freq (int): Base frequency for rotary embedding. -1 to disable.
         init_values (float): Init scale for layer scale.
+        attn_impl (str): Attention backend ("sdpa", "math", or "triton") used by transformer blocks.
     """
 
     def __init__(
@@ -68,6 +69,7 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        attn_impl: str = "sdpa",
     ):
         super().__init__()
 
@@ -89,6 +91,7 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    attn_impl=attn_impl,
                 )
                 for _ in range(depth)
             ]
@@ -106,6 +109,7 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    attn_impl=attn_impl,
                 )
                 for _ in range(depth)
             ]
@@ -197,13 +201,14 @@ class Aggregator(nn.Module):
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
 
-        # Normalize images and reshape for patch embed
-        images = (images - self._resnet_mean) / self._resnet_std
+        # Normalize images and reshape for patch embed 
+        images = (images - self._resnet_mean.to(images.dtype)) / self._resnet_std.to(images.dtype)
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
+        # print(f"Before patch_embed: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         patch_tokens = self.patch_embed(images)
-
+        # print(f"After patch_embed: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
@@ -234,13 +239,15 @@ class Aggregator(nn.Module):
         global_idx = 0
         output_list = []
 
-        for _ in range(self.aa_block_num):
+        for k in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
+                    # print('Processing frame attention', k)
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos
                     )
                 elif attn_type == "global":
+                    # print('Processing global attention', k)
                     tokens, global_idx, global_intermediates = self._process_global_attention(
                         tokens, B, S, P, C, global_idx, pos=pos
                     )
@@ -249,12 +256,24 @@ class Aggregator(nn.Module):
 
             for i in range(len(frame_intermediates)):
                 # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list.append(concat_inter)
+                # concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                
+                
+                if k in self.intermediate_layer_idx: # until last two blocks we offload to CPU
+                    # print('Saving intermediate tokens to CPU for layer', k)
 
-        del concat_inter
-        del frame_intermediates
-        del global_intermediates
+                    concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                    if self.offload_intermediate and k != self.aa_block_num - 1: # keeping last block on GPU
+                        # dequantize to lower precision
+                        # concat_inter = concat_inter.to(torch.bfloat16)
+                        concat_inter = concat_inter.to("cpu", non_blocking=True)
+                    output_list.append(concat_inter)
+                
+            # del concat_inter
+            # for i in range(len(output_list)-2):
+            #     output_list[i] = output_list[i].to("cuda", non_blocking=True)
+            del frame_intermediates
+            del global_intermediates
         return output_list, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
@@ -273,10 +292,16 @@ class Aggregator(nn.Module):
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
-                tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(
+                    self.frame_blocks[frame_idx],
+                    tokens,
+                    pos,
+                    use_reentrant=self.use_reentrant,
+                )
             else:
                 tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
+            
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
@@ -296,8 +321,14 @@ class Aggregator(nn.Module):
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(
+                    self.global_blocks[global_idx],
+                    tokens,
+                    pos,
+                    use_reentrant=self.use_reentrant,
+                )
             else:
+                # ~1k MB in float32, and ~536 MB in bfloat16
                 tokens = self.global_blocks[global_idx](tokens, pos=pos)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
